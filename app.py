@@ -5,7 +5,7 @@ import logging
 import tempfile
 import shutil
 from autotable import AutoTable
-from extraction import extract_tables_from_docx, extract_content_to_json
+from extraction import extract_tables_from_docx, extract_content_to_json, save_aspose_json
 from llm_clients import APIClient, OllamaClient
 import config
 
@@ -63,22 +63,31 @@ def save_to_history(source_path, target_filename, history_dir="history", max_rec
             except Exception as e:
                 logging.error(f"Failed to delete old history file {file_to_delete}: {e}")
 
+class StreamlitLogHandler(logging.Handler):
+    def __init__(self, placeholder):
+        super().__init__()
+        self.placeholder = placeholder
+        self.log_buffer = []
+
+    def emit(self, record):
+        # 剔除失败日志 (ERROR及以上级别)
+        if record.levelno >= logging.ERROR:
+            return
+            
+        msg = self.format(record)
+        
+        # 额外过滤：如果日志内容包含 'error' (忽略大小写)，也不显示
+        if "error" in msg.lower():
+            return
+
+        self.log_buffer.append(msg)
+        # 实时更新显示最新的 50 行日志，避免页面卡顿
+        content = "\n".join(self.log_buffer[-50:])
+        self.placeholder.code(content, language="text")
+
 def load_css():
     st.markdown("""
         <style>
-        /* 全局深色背景 */
-        .stApp {
-            background-color: #1E1E1E;
-            color: #E0E0E0;
-            font-family: 'Segoe UI', 'Source Sans Pro', sans-serif;
-        }
-
-        /* 侧边栏样式覆盖 */
-        [data-testid="stSidebar"] {
-            background-color: #252526;
-            border-right: 1px solid #333;
-        }
-
         /* 动画定义 */
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(10px); }
@@ -90,41 +99,43 @@ def load_css():
             to { opacity: 1; transform: translateX(0); }
         }
 
-        /* 增强的容器样式 - 深色模式 */
+        /* 增强的容器样式 - 适配主题 */
         .step-container {
             animation: slideInRight 0.4s ease-out;
             padding: 30px;
-            background-color: #2D2D2D;
+            background-color: var(--secondary-background-color);
             border-radius: 15px;
             margin-bottom: 25px;
-            border: 1px solid #3E3E3E;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            border: 1px solid rgba(128, 128, 128, 0.2);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
         }
 
-        /* 标题样式 - 提高对比度 */
+        /* 标题样式 */
         h1 {
-            color: #4da6ff;
+            color: var(--primary-color);
             text-align: center;
             font-weight: 800;
             padding-bottom: 10px;
             font-size: 2.5rem;
-            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            text-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
         
         .description-text {
             text-align: center;
-            color: #B0B0B0;
+            color: var(--text-color);
+            opacity: 0.8;
             margin-bottom: 40px;
             font-size: 1.1rem;
         }
 
-        /* 步骤指示器美化 - 深色模式 */
+        /* 步骤指示器美化 */
         .step-indicator {
             display: flex;
             justify-content: center;
             margin-bottom: 40px;
             font-weight: 600;
-            color: #808080;
+            color: var(--text-color);
+            opacity: 0.6;
             position: relative;
         }
         
@@ -136,7 +147,8 @@ def load_css():
             left: 20%;
             right: 20%;
             height: 2px;
-            background-color: #404040;
+            background-color: var(--text-color);
+            opacity: 0.2;
             z-index: 0;
             transform: translateY(-50%);
         }
@@ -146,22 +158,22 @@ def load_css():
             padding: 10px 20px;
             position: relative;
             z-index: 1;
-            background-color: #1E1E1E; /* 与背景色一致，遮挡线条 */
+            background-color: var(--background-color);
             border-radius: 20px;
             transition: all 0.3s;
-            border: 1px solid #333;
+            border: 1px solid rgba(128, 128, 128, 0.3);
         }
         
         .step-indicator .active {
-            color: #4da6ff;
-            background-color: #1a3c5e;
-            border: 1px solid #4da6ff;
+            color: var(--primary-color);
+            background-color: var(--secondary-background-color);
+            border: 1px solid var(--primary-color);
             box-shadow: 0 0 10px rgba(77, 166, 255, 0.3);
         }
         
         .step-indicator .completed {
             color: #4caf50;
-            background-color: #1e3324;
+            background-color: var(--secondary-background-color);
             border: 1px solid #4caf50;
         }
         
@@ -175,19 +187,7 @@ def load_css():
         }
         .stButton>button:hover {
             transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-        }
-
-        /* 输入框和单选框文字颜色 */
-        .stRadio label, .stFileUploader label {
-            color: #E0E0E0 !important;
-        }
-        
-        /* 提示框样式适配 */
-        .stAlert {
-            background-color: #2D2D2D;
-            color: #E0E0E0;
-            border: 1px solid #3E3E3E;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
         }
 
         /* 隐藏页脚 */
@@ -239,6 +239,8 @@ def main():
         st.session_state.kb_file_data = None # {'name': str, 'data': bytes}
     if 'processed_file' not in st.session_state:
         st.session_state.processed_file = None 
+    if 'intermediate_files' not in st.session_state:
+        st.session_state.intermediate_files = {} # {'filename': bytes} 
         
     setup_logging()
 
@@ -260,6 +262,16 @@ def main():
             else:
                 ollama_host = st.text_input("Ollama Host", value=config.OLLAMA_HOST)
                 ollama_model = st.text_input("Ollama Model", value=config.OLLAMA_MODEL_NAME)
+            
+            # 超时设置
+            timeout_seconds = st.slider(
+                "请求超时时间 (秒)", 
+                min_value=60, 
+                max_value=600, 
+                value=300, 
+                step=30,
+                help="设置 API 请求的最大等待时间。处理大表格或大知识库时，建议调大此值。"
+            )
         
         st.divider()
         local_ip = get_local_ip()
@@ -392,15 +404,23 @@ def main():
 
                                     # 3. 初始化 LLM
                                     if run_mode == "api":
-                                        client = APIClient(api_base_url, api_key, api_model)
+                                        client = APIClient(api_base_url, api_key, api_model, timeout=timeout_seconds)
                                     else:
-                                        client = OllamaClient(ollama_host, ollama_model)
+                                        client = OllamaClient(ollama_host, ollama_model, timeout=timeout_seconds)
 
                                     # 4. 如果是 Word 知识库，先提取
                                     final_kb_path = kb_path
+                                    
+                                    # 4.1 始终生成知识库的中间文件（如果是 Word）
                                     if kb_info["type"] == "docx":
-                                        json_kb_path = os.path.join(temp_dir, "extracted.json")
-                                        with st.status("🔍 正在分析文档内容...", expanded=True) as status:
+                                        json_kb_path = os.path.join(temp_dir, "kb_extracted.json")
+                                        aspose_kb_path = os.path.join(temp_dir, "kb_aspose.json")
+                                        
+                                        with st.status("🔍 正在分析知识库内容...", expanded=False) as status:
+                                            # 生成 Aspose 结构文件 (供下载)
+                                            save_aspose_json(kb_path, aspose_kb_path)
+                                            
+                                            # 智能提取内容 (供填表用)
                                             extract_success = extract_content_to_json(kb_path, json_kb_path, client)
                                             if not extract_success:
                                                 status.update(label="❌ 提取失败", state="error")
@@ -408,6 +428,14 @@ def main():
                                                 st.stop()
                                             final_kb_path = json_kb_path
                                             
+                                            # 保存到 Session State 供下载
+                                            if os.path.exists(aspose_kb_path):
+                                                with open(aspose_kb_path, "rb") as f:
+                                                    st.session_state.intermediate_files["kb_aspose.json"] = f.read()
+                                            if os.path.exists(json_kb_path):
+                                                with open(json_kb_path, "rb") as f:
+                                                    st.session_state.intermediate_files["kb_content.json"] = f.read()
+
                                             # 实时显示提取的 JSON 数据
                                             try:
                                                 with open(final_kb_path, "r", encoding="utf-8") as f:
@@ -417,25 +445,50 @@ def main():
                                             except Exception as e:
                                                 st.warning(f"无法显示中间数据: {e}")
 
+                                    # 4.2 生成模板的中间文件
+                                    template_aspose_path = os.path.join(temp_dir, "template_aspose.json")
+                                    save_aspose_json(temp_word_path, template_aspose_path)
+                                    if os.path.exists(template_aspose_path):
+                                        with open(template_aspose_path, "rb") as f:
+                                            st.session_state.intermediate_files["template_aspose.json"] = f.read()
+
                                     # 5. 运行 AutoTable
                                     temp_output_dir = os.path.join(temp_dir, "output")
-                                    with st.status("🤖 正在智能填表...", expanded=True) as status:
-                                        at = AutoTable(final_kb_path, temp_word_path, client, temp_output_dir)
-                                        if at.run():
-                                            status.update(label="✅ 完成！", state="complete")
-                                            # 处理结果
-                                            generated_files = [f for f in os.listdir(temp_output_dir) if f.endswith(".docx")]
-                                            if generated_files:
-                                                result_file = generated_files[0]
-                                                result_path = os.path.join(temp_output_dir, result_file)
-                                                save_to_history(result_path, result_file)
-                                                with open(result_path, "rb") as f:
-                                                    st.session_state.processed_file = (result_file, f.read())
+                                    with st.status("🤖 正在智能填表...", expanded=False) as status:
+                                        # 创建日志显示区域
+                                        st.write("📋 执行日志")
+                                        log_placeholder = st.empty()
+                                        
+                                        # 配置日志处理器
+                                        log_handler = StreamlitLogHandler(log_placeholder)
+                                        log_handler.setLevel(logging.INFO)
+                                        formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+                                        log_handler.setFormatter(formatter)
+                                        
+                                        # 添加到根日志记录器
+                                        root_logger = logging.getLogger()
+                                        root_logger.addHandler(log_handler)
+                                        
+                                        try:
+                                            at = AutoTable(final_kb_path, temp_word_path, client, temp_output_dir)
+                                            if at.run():
+                                                status.update(label="✅ 完成！", state="complete")
+                                                # 处理结果
+                                                generated_files = [f for f in os.listdir(temp_output_dir) if f.endswith(".docx")]
+                                                if generated_files:
+                                                    result_file = generated_files[0]
+                                                    result_path = os.path.join(temp_output_dir, result_file)
+                                                    save_to_history(result_path, result_file)
+                                                    with open(result_path, "rb") as f:
+                                                        st.session_state.processed_file = (result_file, f.read())
+                                                else:
+                                                    st.error("未生成文件")
                                             else:
-                                                st.error("未生成文件")
-                                        else:
-                                            status.update(label="❌ 失败", state="error")
-                                            st.error("填表过程出错")
+                                                status.update(label="❌ 失败", state="error")
+                                                st.error("填表过程出错")
+                                        finally:
+                                            # 清理日志处理器
+                                            root_logger.removeHandler(log_handler)
                                             
                             except Exception as e:
                                 st.error(f"发生错误: {str(e)}")
@@ -445,6 +498,8 @@ def main():
             if st.session_state.processed_file:
                 with st.container(border=True):
                     st.success("✅ 文档生成成功！")
+                    
+                    # 结果下载
                     fname, data = st.session_state.processed_file
                     st.download_button(
                         label=f"⬇️ 下载结果: {fname}",
@@ -454,6 +509,32 @@ def main():
                         type="primary",
                         use_container_width=True
                     )
+                    
+                    # 中间文件下载区域
+                    if st.session_state.intermediate_files:
+                        st.markdown("---")
+                        st.subheader("🛠️ 调试/中间文件下载")
+                        
+                        # 使用 columns 展示下载按钮
+                        int_cols = st.columns(len(st.session_state.intermediate_files))
+                        
+                        for idx, (filename, file_data) in enumerate(st.session_state.intermediate_files.items()):
+                            # 根据文件类型选择列
+                            col_idx = idx % 3
+                            with int_cols[col_idx]:
+                                label_prefix = "📄"
+                                if "aspose" in filename:
+                                    label_prefix = "🏗️" # 结构文件
+                                elif "content" in filename:
+                                    label_prefix = "📝" # 内容文件
+                                    
+                                st.download_button(
+                                    label=f"{label_prefix} {filename}",
+                                    data=file_data,
+                                    file_name=filename,
+                                    mime="application/json",
+                                    use_container_width=True
+                                )
 
     # --- 底部历史记录 (始终显示) ---
     st.markdown("---")

@@ -1,18 +1,27 @@
 import os
 import pandas as pd
 import logging
-from docx import Document
-from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
 import json
+import subprocess
+import shutil
 from datetime import datetime
-
 import re
+from itertools import groupby
 
 logger = logging.getLogger(__name__)
 
+# Aspose EXE Path
+ASPOSE_EXE = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), 
+    "..", 
+    "Aspose.Words for .NET v25.7.0", 
+    "AsposeLicenseDemo", 
+    "bin", "Debug", "net9.0", 
+    "AsposeLicenseDemo.exe"
+))
+
 class AutoTable:
-    """自动化填表处理核心类"""
+    """自动化填表处理核心类 (Aspose Backend)"""
     def __init__(self, knowledge_base_path, word_template_path, llm_client, output_folder="output"):
         self.knowledge_base_path = knowledge_base_path
         self.word_template_path = word_template_path
@@ -20,7 +29,11 @@ class AutoTable:
         self.llm_client = llm_client
         self.knowledge_base = None
         self.knowledge_dict = None
-        self.doc = None
+        
+        # New state variables for Aspose workflow
+        self.table_structures = []
+        self.pending_instructions = []
+        self.doc_path = word_template_path # Store path instead of object
 
         if not os.path.exists(output_folder):
             os.makedirs(output_folder)
@@ -29,38 +42,18 @@ class AutoTable:
         try:
             logger.info(f"正在加载知识库: {self.knowledge_base_path}")
             if self.knowledge_base_path.endswith('.xlsx'):
-                # 读取所有工作表，不将第一行作为表头（header=None）
-                # 这样可以处理 Key-Value 型的表格，也可以避免错误列名的问题
                 dfs = pd.read_excel(self.knowledge_base_path, sheet_name=None, header=None)
-                
-                # 构建结构化知识库：{ "Sheet名": [ [行1数据], [行2数据], ... ], ... }
                 structured_data = {}
                 total_records = 0
-                
                 for sheet_name, df in dfs.items():
-                    # 处理 NaN 值为 None/空字符串
                     df = df.where(pd.notnull(df), "")
-                    
-                    # 转换为二维列表 (List of Lists)
-                    # 这种格式最通用，既适合列表型表格，也适合 KV 型表格
-                    # LLM 可以根据数据分布自行推断行列关系
                     matrix_data = df.values.tolist()
-                    
-                    # 特殊处理 Text_Content: 如果它是原来的格式（有 Header），pd.read_excel(header=None) 会把 Header 也读成第一行数据
-                    # 但 Text_Content 比较简单，即使把 'Content', 'Type' 当作数据也不影响理解
-                    
                     structured_data[sheet_name] = matrix_data
                     total_records += len(matrix_data)
-                
                 self.knowledge_dict = structured_data
                 logger.info(f"Excel知识库加载完成，共读取 {len(dfs)} 个工作表，合计 {total_records} 条数据")
-                
-                # 输出结构化后的字典供调试/查看
-                logger.info(f"结构化处理后的知识库字典: {json.dumps(self.knowledge_dict, ensure_ascii=False, default=str)}")
-                
                 return True
             elif self.knowledge_base_path.endswith('.json'):
-                # 直接读取 JSON 格式的知识库
                 with open(self.knowledge_base_path, 'r', encoding='utf-8') as f:
                     self.knowledge_dict = json.load(f)
                 logger.info(f"JSON知识库加载完成: {self.knowledge_base_path}")
@@ -74,211 +67,47 @@ class AutoTable:
 
     def load_template(self):
         try:
-            logger.info(f"正在加载Word模板: {self.word_template_path}")
-            self.doc = Document(self.word_template_path)
-            logger.info(f"模板加载完成，包含{len(self.doc.tables)}个表格")
+            logger.info(f"正在分析Word模板结构 (Aspose): {self.word_template_path}")
+            if not os.path.exists(ASPOSE_EXE):
+                logger.error(f"Aspose Executable not found at: {ASPOSE_EXE}")
+                return False
+
+            print(f"[Skill] Invoking Aspose Backend for Table Extraction: {ASPOSE_EXE}") # Console output
+            cmd = [ASPOSE_EXE, self.word_template_path, "extract-tables"]
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            
+            if result.returncode != 0:
+                logger.error(f"Aspose extraction failed: {result.stderr}")
+                return False
+                
+            self.table_structures = json.loads(result.stdout)
+            logger.info(f"模板分析完成，包含{len(self.table_structures)}个表格")
             return True
         except Exception as e:
-            error_msg = str(e)
-            if "no relationship of type" in error_msg or "File is not a zip file" in error_msg:
-                logger.error(f"模板加载失败: 文件格式不正确。请确保您上传的是真正的 .docx 文件，而不是直接修改后缀名的 .doc 文件。请尝试用 Word 打开该文件并'另存为' .docx 格式。({error_msg})")
-            else:
-                logger.error(f"模板加载失败: {error_msg}")
+            logger.error(f"模板加载失败: {str(e)}")
             return False
 
-    def _is_potential_slot(self, text):
-        """判断文本是否为填空位"""
-        if not text:
-            return True
-            
-        # 移除常见的不可见字符和空白
-        clean_text = text.strip().replace('\u200b', '').replace('\u3000', ' ')
-        if not clean_text:
-            return True
-            
-        # 负向规则：排除明显的表头/Label（防止误判）
-        # 1. "第( )完成人"、"第( )完成单位" 类型的表头
-        if re.match(r'^第\s*[（(]\s*[）)]\s*(?:完成人|作者|完成单位|单位|起草人)', clean_text):
-            return False
-            
-        if set(clean_text).issubset(set(" _()（）")):
-            return True
-        
-        # 正则增强规则
-        # 包含连续下划线
-        if re.search(r'[_]{2,}', clean_text):
-            return True
-        # 包含空括号 或 提示性括号
-        elif re.search(r'[(\uff08](?:\s*|.*?(?:填写|输入|粘贴|限|字|内容).*?)[)\uff09]', clean_text):
-            return True
-        # 包含 "年" 和 "月" 的日期格式
-        elif '年' in clean_text and '月' in clean_text:
-            if not re.match(r'^\d', clean_text):
-                 if re.search(r'[_]+|\s+', clean_text):
-                     return True
-        # 启发式规则：以冒号结尾的 Prompt
-        elif re.search(r'[:：]\s*$', clean_text):
-            return True
-        # 针对大表格的长文本Prompt（如 "1. 成果简介..."）
-        # 特征：以数字序号开头，且长度超过一定阈值，暗示这是一个问题描述而非简单标题
-        elif re.match(r'^\d+[.、\s]', clean_text) and len(clean_text) > 5:
-            return True
-            
-        return False
+    def _convert_aspose_row_to_python_style(self, aspose_rows):
+        """Convert PascalCase Aspose JSON to snake_case python-docx style structure"""
+        python_rows = []
+        for r_idx, row in enumerate(aspose_rows):
+            py_row = []
+            for c_idx, cell in enumerate(row):
+                # Aspose keys: Text, IsMerged, IsEmpty
+                cell_info = {
+                    "id": f"{r_idx}_{c_idx}",
+                    "text": cell.get("Text", ""),
+                    "is_merged": cell.get("IsMerged", False),
+                    "is_empty": cell.get("IsEmpty", False)
+                }
+                if cell_info["is_merged"]:
+                    del cell_info["id"]
+                py_row.append(cell_info)
+            python_rows.append(py_row)
+        return python_rows
 
-    def _has_visual_placeholder(self, element):
-        """
-        检查段落或单元格是否包含“视觉占位符”（带下划线的空白区域）。
-        """
-        paragraphs = []
-        if hasattr(element, 'paragraphs'):
-            paragraphs = element.paragraphs
-        else:
-            paragraphs = [element] # Assume it's a paragraph
-            
-        for para in paragraphs:
-            for run in para.runs:
-                # 检查是否有下划线
-                is_underlined = run.underline is not None and run.underline is not False
-                # 检查内容是否主要为空白
-                text = run.text
-                is_blank = all(c in ' \t\u3000\u00A0' for c in text)
-                
-                if is_underlined and is_blank and len(text) >= 2:
-                    return True
-        return False
-
-    def _preprocess_paragraphs(self, paragraphs):
-        """
-        预处理段落列表：识别填空位
-        返回: (markdown_text, anchor_map, id_to_text_map)
-        anchor_map: {anchor_id: paragraph_index}
-        """
-        anchor_map = {}
-        id_to_text_map = {}
-        markdown_lines = []
-        anchor_counter = 1
-        
-        for idx, para in enumerate(paragraphs):
-            text = para.text.strip()
-            
-            # 检查是否包含视觉占位符（如下划线空格）
-            has_visual_slot = self._has_visual_placeholder(para)
-            
-            # 修复：跳过空段落，除非它包含视觉占位符
-            if not text and not has_visual_slot:
-                continue
-                
-            if self._is_potential_slot(text) or has_visual_slot:
-                anchor_id = f"{{{{ID_{anchor_counter:03d}}}}}"
-                anchor_map[anchor_id] = idx
-                id_to_text_map[anchor_id] = f"原内容: '{text}'"
-                
-                # 在Markdown中展示
-                # 尝试更智能的展示：如果段落很短，直接展示ID；如果长，展示部分上下文？
-                # 暂时简单处理：直接用 ID 替换原文本展示给 LLM
-                display_text = text if text else "[下划线填空区]"
-                markdown_lines.append(f"- {anchor_id} (原: {display_text})")
-                anchor_counter += 1
-            else:
-                # 如果不是填空位，但也包含在文档中，是否给LLM看？
-                # 如果是纯文本，可能包含上下文信息。
-                # 最好还是提供一些上下文。
-                if len(text) > 0:
-                    markdown_lines.append(f"- {text}")
-
-        markdown_text = "\n".join(markdown_lines)
-        return markdown_text, anchor_map, id_to_text_map
-
-    def _preprocess_table(self, table):
-        """
-        预处理表格：识别填空位，生成带锚点的Markdown文本，并记录锚点映射。
-        返回: (markdown_text, anchor_map, id_to_text_map)
-        """
-        anchor_map = {}
-        id_to_text_map = {}
-        markdown_lines = []
-        anchor_counter = 1
-        
-        # 使用列表存储已处理的单元格 _tc 对象，以处理合并单元格
-        processed_tcs = [] # Store (tc_object, anchor_id)
-        
-        # 遍历每一行
-        for row_idx, row in enumerate(table.rows):
-            row_cells_text = []
-            for col_idx, cell in enumerate(row.cells):
-                cell_text = cell.text.strip()
-                
-                # 检查该单元格是否已处理过
-                current_tc = cell._tc
-                existing_anchor_id = None
-                for seen_tc, seen_id in processed_tcs:
-                    if current_tc == seen_tc:
-                        existing_anchor_id = seen_id
-                        break
-                
-                if existing_anchor_id:
-                    # 如果已处理过，直接使用之前的 ID
-                    row_cells_text.append(existing_anchor_id)
-                    # 注意：我们不需要再次添加到 anchor_map，因为之前已经加过了
-                    # 但我们需要确保在 Markdown 中显示这个 ID，以便 LLM 理解表格结构
-                    continue
-
-                # 判断是否是填空位
-                is_potential_slot = self._is_potential_slot(cell_text)
-                has_visual_slot = self._has_visual_placeholder(cell)
-                
-                if is_potential_slot or has_visual_slot:
-                    anchor_id = f"{{{{ID_{anchor_counter:03d}}}}}"
-                    anchor_map[anchor_id] = (row_idx, col_idx)
-                    
-                    # 记录为已处理
-                    processed_tcs.append((current_tc, anchor_id))
-                    
-                    # 尝试获取上下文提示（Label）
-                    context_hint = ""
-                    try:
-                        # 尝试获取左侧单元格文本作为提示
-                        if col_idx > 0:
-                            left_text = row.cells[col_idx-1].text.strip()
-                            if left_text and len(left_text) < 20:
-                                context_hint = f" | 左侧Label: {left_text}"
-                        
-                        # 如果左侧为空，尝试获取上方单元格文本（针对上下结构的表格）
-                        if not context_hint and row_idx > 0:
-                            top_text = table.cell(row_idx-1, col_idx).text.strip()
-                            if top_text and len(top_text) < 20:
-                                context_hint = f" | 上方Label: {top_text}"
-                    except Exception:
-                        pass
-
-                    # 记录原始文本和上下文提示，供LLM参考
-                    id_to_text_map[anchor_id] = f"原内容: '{cell_text}'{context_hint}"
-                    row_cells_text.append(anchor_id)
-                    anchor_counter += 1
-                else:
-                    # 调试日志：记录为什么这个单元格没有被选中（采样打印）
-                    # if len(cell_text) > 0 and len(cell_text) < 10:
-                    #    logger.debug(f"跳过单元格: '{cell_text}' - 未匹配规则")
-                    
-                    # 记录非填空位单元格为已处理（虽然没有ID，但我们不想重复处理）
-                    # 不过，非填空位通常有内容，如果重复出现，在Markdown里重复显示内容是正确的
-                    # 所以这里不需要记录 processed_tcs，除非我们想去重显示？
-                    # 对于Markdown表格，如果合并单元格跨列，我们通常希望显示 | Content | Content | Content |
-                    # 这样结构是对齐的。所以这里保持原样。
-                    
-                    # 清理一下换行符，以免破坏Markdown表格结构
-                    clean_text = cell_text.replace('\n', '<br>')
-                    row_cells_text.append(clean_text)
-            
-            markdown_lines.append("| " + " | ".join(row_cells_text) + " |")
-            
-        # 组合成Markdown表格字符串
-        markdown_text = "\n".join(markdown_lines)
-        return markdown_text, anchor_map, id_to_text_map
-
-    def analyze_tables_with_llm(self, table_markdown, knowledge_context, id_to_text_map, used_contexts=None):
-        # 动态判断知识库格式，生成不同的 Prompt 描述
+    def analyze_tables_with_llm(self, table_structure, knowledge_context, used_contexts=None):
+        # Same logic as before
         data_format_desc = "扁平化的 JSON 键值对（Key-Value）" if isinstance(knowledge_context, dict) else "按 Sheet（来源）分组的二维数组（矩阵）格式"
         
         used_context_desc = ""
@@ -290,559 +119,552 @@ class AutoTable:
         {json.dumps(used_contexts, ensure_ascii=False)}
         
         **请务必从知识库中选择一个【未使用过】的新实体数据进行填充。**
-        - 如果知识库是人员列表，请选择下一个不同的人员。
-        - 如果知识库是项目列表，请选择下一个不同的项目。
-        - 如果确实没有更多新数据，才允许重复。
         """
 
         prompt = f"""
-        请分析以下带有锚点（格式如 {{{{ID_XXX}}}}）的文档内容（表格或段落），并结合提供的知识库数据，将正确的值填入对应的锚点。
+        请分析以下表格结构（JSON格式），并结合提供的知识库数据，直接在 JSON 数据上修改，将知识库中的值填入对应的单元格。
+        
+        **重要提示**：输出必须是严格合法的 JSON 格式。注意转义字符，不要有尾随逗号。
         
         知识库数据（{data_format_desc}）：
         {json.dumps(knowledge_context, ensure_ascii=False, default=str)}
         
-        文档内容结构（Markdown）：
-        {table_markdown}
+        表格结构（JSON List of Tables）：
+        {json.dumps(table_structure, ensure_ascii=False)}
         
-        锚点对应的原始文本（参考用，可能包含提示信息）：
-        {json.dumps(id_to_text_map, ensure_ascii=False)}
         {used_context_desc}
         
-        **核心原则：严格基于知识库**
-        1. **绝对禁止编造数据**：你只能使用“知识库数据”中显式提供的信息。
-        3. **禁止推测**：不要根据常识或上下文去猜测缺失的信息（例如：不要自己编造邮编、电话、日期，也不要推测上级单位）。原文没有就是没有。
-
-        请仔细思考字段的对应关系。
-        注意：知识库数据可能为以下两种格式之一：
-        1. 按 Sheet（来源）分组的二维数组（矩阵）格式。
-        2. 扁平化的 JSON 键值对（Key-Value）。
+        **任务说明**：
+        0. **核心原则（防幻觉）**：你只能使用提供的“知识库数据”来填充表格。如果知识库中没有找到对应的信息，**请保持单元格原样**（或留空），**绝对不要编造**数据。不要尝试计算或推测日期、数字等，除非知识库里有明确依据。
+        1. 你可以直接修改上述“表格结构”JSON中的 `text` 字段。
+        2. **优先填写空白格**：请优先寻找与 Label 相邻的 **空白单元格** (`"is_empty": true`) 进行填写，而不是直接修改 Label 所在的单元格。
+           - 例如：遇到 `[[{{"text": "姓名："}}, {{"text": "", "is_empty": true}}]]`，请将第二个单元格修改为 `{{ "text": "张三" }}`。
+           - 只有当没有相邻空白格时（即 Label 和下划线在同一个单元格内），才修改 Label 单元格。
+        3. **不要修改** `id` 和 `is_merged` 字段。
+        4. **Label/表头处理（严禁重复）**：
+           - **短Label（如“姓名：”）**：请直接在Label后填入内容。例如：“姓名：张三”。
+           - **复杂排版（如“起始：____ 年 __ 月”）**：请只替换下划线或空白部分，**绝对不要**重复“起始：”这个词。例如：“起始：1998 年 1 月”。
+           - **多字段合并（如“起始... 完成...”）**：如果单元格包含多个需要填写的时间点（如起始时间、完成时间），请确保填入所有值。**严禁**在填好的内容后重复保留未填写的模板（如“完成：   年   月”）。正确示例：“起始：2020年9月  完成：2023年6月”。
+           - **长文本题（如“1. 成果简介...”、“3. 成果的创新点...”）**：这不仅是标题，也是填空区域。请务必将知识库中对应的长文本内容**追加**到该单元格的标题下方（换行）。**不要**因为它是标题就跳过！
+        5. **避免重复**：请仔细检查，如果单元格内已经包含了标题（如“本人签名：”或“起始：”），你填入的内容**不要**再次包含该标题字样。
+        6. **列表实体匹配**：如果知识库中包含“主要完成人”等列表数据，请根据表格的顺序或去重逻辑依次选择实体填入。如果是“第( )完成人”，请同时填入对应的序号（如“1”）。
+        7. **自动增行（重要）**：如果知识库中的列表数据（如获奖情况、成员名单）数量超过了表格现有的行数，请直接在 JSON 结构中**复制并追加**新的 Row 对象。系统会自动识别这些新增的行并在文档中插入。请确保新增行的格式与该列表区域的其他行保持一致。
         
-        请根据上下文自动推断。
-        - 如果遇到包含换行符被拼接的字段名（如“现从事工作及专长”），请尝试模糊匹配。
-        - **必须**参考提供的“锚点对应的原始文本”中的上下文线索（如“左侧Label”或“上方Label”）来确定填入内容。
+        **返回格式**：
+        请返回**修改后的完整 JSON 表格结构**。
+        格式必须与输入的“表格结构”完全一致（包含 TableIndex 等），只是部分 `text` 字段被更新了。
         
-        特别注意以下字段的提取和填充：
-        1. **多键合并与分发**：
-           - **合并**：如果表格中只有一个对应字段的单元格，但知识库中有多个相关键（如 "奖项_1", "奖项_2"），请将它们合并为一个完整段落（如 "1. A奖；2. B奖"）。
-           - **分发**：如果表格中针对同一属性（如“爱好”）预留了**多个独立**的单元格（即多个锚点），且知识库中有对应的多条数据，请将数据**分散填入**不同的锚点，不要重复。
-              - 例如：表格“爱好”下有 `{{{{ID_001}}}}` 和 `{{{{ID_002}}}}`，知识库有 `爱好_1: A`, `爱好_2: B`。
-              - 正确：`"{{{{ID_001}}}}": "A"`, `"{{{{ID_002}}}}": "B"`
-              - 错误：`"{{{{ID_001}}}}": "A, B"`, `"{{{{ID_002}}}}": "A, B"`
-              - **注意**：如果数据条数少于单元格数（如只有 `爱好_1: A`），请只填入第一个锚点，其余锚点**不要**在返回的JSON中出现（即留空）。
-        2. **复杂文本字段**：如“现从事工作及专长”、“何时何地受何奖励”。这些内容可能较长，包含多行，请务必提取完整。
-        3. **基础信息字段**：如“工作单位”、“电子信箱”、“通讯地址”。这些信息可能散落在不同位置，请仔细查找。
-        4. **格式处理**：如果源数据中包含换行符（\\n），请根据目标表格的语境合理保留或替换为逗号/空格。
-        5. **问答式填充**：
-           - 如果锚点对应的“原始文本”是一个问题或指令（例如 "1. 成果简介..."），请**只返回该问题的答案内容**，不要重复问题本身。程序会自动将答案追加在问题下方。
-
-        如果一个字段在多个地方出现，请优先选择最匹配上下文的值。
-        
-        **禁止行为**：
-        - 严禁在表格末尾或其他空位自动生成“总结”、“备注”或“额外说明”，除非表格中有明确的“备注”或“总结”标签指示。
-        - 如果锚点没有明确的上下文指示（Label），且无法确定其对应关系，请保持为空，不要强行填入剩余的知识库信息。
-        - **再次强调**：知识库中不存在的信息，填入值必须为空字符串。
-
-        重要：请返回**完整**的填入内容。
-        如果原始文本是占位符（如 "____"），直接返回填入值。
-        如果原始文本包含提示信息且你需要保留（例如 "姓名：____"），请返回完整内容（例如 "姓名：张三"）。
-        如果原始文本是日期格式（如 "____年__月__日"），请返回填充好的完整日期字符串（例如 "2024年1月1日"）。
-        通常情况下，对于包含下划线的单元格，用户希望你填充内容并覆盖原有占位符。
-        
-        返回 JSON 格式：
-        {{
-            "__identity__": "这里填入你本次使用的实体唯一标识（如姓名：张三），用于后续去重",
-            "{{{{ID_001}}}}": "填入的值1",
-            "{{{{ID_002}}}}": "",
+        为了方便去重，请在 JSON 列表的**最前面**添加一个特殊对象：
+        [
+            {{ "__identity__": "本次使用的实体标识（如张三）" }},
+            {{ "TableIndex": 1, "Rows": [...] }},
+            {{ "TableIndex": 2, "Rows": [...] }},
             ...
-        }}
-        请确保只返回JSON格式数据，不要包含其他内容。
+        ]
         """
         try:
             messages = [
-                {"role": "system", "content": "你是一个专业的文档填充助手，擅长处理复杂表格和多层级数据映射。"},
+                {"role": "system", "content": "你是一个专业的表格填充助手。"},
                 {"role": "user", "content": prompt}
             ]
             result = self.llm_client.chat_completion(messages, temperature=0.1)
-            json_str = self._extract_json(result)
-            return json.loads(json_str)
+            return self._parse_llm_json(result)
         except Exception as e:
             logger.error(f"表格分析失败: {str(e)}")
-            return {}
+            return []
 
-    def _extract_json(self, text):
+
+    def _parse_llm_json(self, text):
+        text = text.strip()
+        
+        # 1. 尝试提取 Markdown 代码块 (最可靠)
+        match = re.search(r'```(?:json)?\s*(.*?)```', text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+        
+        # 2. 尝试直接解析
         try:
-            json.loads(text)
-            return text
+            return json.loads(text)
         except json.JSONDecodeError:
-            import re
-            # 移除 replace('\n', '') 以保留 JSON 字符串中的换行符
-            json_match = re.search(r'({.*})', text, re.DOTALL)
-            if json_match:
-                return json_match.group(1)
-            raise ValueError("未找到有效JSON内容")
-
-    def _extract_paragraph_char_style(self, paragraph):
-        """从段落属性(pPr)中提取默认字符样式"""
-        style = {}
-        try:
-            # 访问底层 XML 元素
-            p = paragraph._element
-            if p.pPr is None:
-                return style
+            pass
             
-            # 安全获取 rPr (Run Properties)
-            # 注意：pPr 是一个 CT_PPr 对象，它可能没有直接的 .rPr 属性访问器
-            # 我们应该使用 find 方法来查找子元素
-            rPr = p.pPr.find(qn('w:rPr'))
-            
-            if rPr is None:
-                return style
-            
-            # 1. 字体名称
-            # rPr.rFonts 可能也是通过 find 获取
-            rFonts = rPr.find(qn('w:rFonts'))
-            if rFonts is not None:
-                # 优先取中文字体(eastAsia)，其次 ascii
-                font_name = rFonts.get(qn('w:eastAsia')) or rFonts.get(qn('w:ascii'))
-                if font_name:
-                    style['name'] = font_name
-            
-            # 2. 字号 (XML中是半点，1/144英寸)
-            sz = rPr.find(qn('w:sz'))
-            if sz is not None and sz.val is not None:
-                try:
-                    # Pt(1) = 2 half-points
-                    # 正常情况：half-points / 2 = points
-                    # 异常情况：某些文档中可能存储的是 EMU 值 (1 pt = 12700 EMU)
-                    val = int(sz.val)
-                    
-                    # 阈值判断：如果值大于 4000 (即 2000pt)，几乎可以肯定是 EMU 单位
-                    # 正常的字号通常在 1-100pt (2-200 half-points) 之间
-                    if val > 4000:
-                        style['size'] = val # 直接作为 EMU 使用
-                    else:
-                        style['size'] = Pt(val / 2) # 作为 half-points 转换
-                except Exception:
-                    pass
-
-            # 3. 加粗
-            b = rPr.find(qn('w:b'))
-            if b is not None:
-                # 标签存在即为真，除非显式设为 false/0
-                val = b.val
-                style['bold'] = False if val in ['0', 'false', 'off'] else True
-            
-            # 4. 颜色
-            color = rPr.find(qn('w:color'))
-            if color is not None and color.val is not None:
-                hex_color = color.val
-                if hex_color != 'auto':
-                    try:
-                        style['color'] = RGBColor.from_string(hex_color)
-                    except Exception:
-                        pass
-                        
-            # 5. 斜体
-            i = rPr.find(qn('w:i'))
-            if i is not None:
-                 val = i.val
-                 style['italic'] = False if val in ['0', 'false', 'off'] else True
-                 
-        except Exception as e:
-            logger.warning(f"提取段落默认样式失败: {e}")
-            
-        return style
-
-    def _extract_run_style(self, run):
-        """提取Run的字体样式"""
-        style = {}
-        if not run:
-            return style
+        # 3. 尝试寻找最外层的 [] 或 {}
+        # 找到第一个 [ 或 {
+        start_idx = -1
+        end_idx = -1
         
-        # 基础属性
-        if run.font.name:
-            style['name'] = run.font.name
-        if run.font.size:
-            style['size'] = run.font.size
-        if run.font.bold is not None:
-            style['bold'] = run.font.bold
-        if run.font.italic is not None:
-            style['italic'] = run.font.italic
-        if run.font.color and run.font.color.rgb:
-            style['color'] = run.font.color.rgb
-        if run.font.underline:
-            style['underline'] = run.font.underline
-            
-        if style:
-            logger.info(f"成功提取字体样式: {style}")
-        else:
-            logger.info("未提取到显式字体样式 (可能是默认样式，将继承段落设置)")
-            
-        return style
-
-    def _apply_run_style(self, run, style):
-        """应用字体样式到Run"""
-        if not style:
-            return
-            
-        if 'name' in style:
-            run.font.name = style['name']
-            # 设置中文字体
-            try:
-                rPr = run._element.get_or_add_rPr()
-                rFonts = rPr.get_or_add_rFonts()
-                rFonts.set(qn('w:eastAsia'), style['name'])
-            except Exception as e:
-                logger.warning(f"设置中文字体失败: {e}")
-            
-        if 'size' in style:
-            run.font.size = style['size']
-        if 'bold' in style:
-            run.font.bold = style['bold']
-        if 'italic' in style:
-            run.font.italic = style['italic']
-        if 'color' in style:
-            run.font.color.rgb = style['color']
-        if 'underline' in style:
-            run.font.underline = style['underline']
-
-    def _smart_fill_paragraph(self, para, value):
-        """
-        尝试智能填充：如果段落包含下划线/空格占位符，则只替换占位符部分，并保留下划线格式。
-        返回 True 表示已处理，False 表示未匹配到占位符，需调用方回退到默认逻辑。
-        """
-        runs = para.runs
-        placeholder_idx = -1
-        
-        # 1. 寻找段落末尾的占位符 Run
-        # 占位符特征：有下划线，且内容主要是空格、下划线、制表符
-        for i, run in enumerate(runs):
-            text = run.text
-            is_underlined = run.underline is not None and run.underline is not False
-            is_placeholder_chars = all(c in ' _\t\u3000\u00A0' for c in text)
-            
-            # 必须有一定的长度（避免误判单个空格），或者是纯下划线
-            if is_underlined and (len(text) >= 1 and is_placeholder_chars):
-                # 进一步检查：如果是空格，必须是下划线的空格。
-                # 这里假设 run.underline 已经过滤了无下划线的情况
-                placeholder_idx = i
+        for i, char in enumerate(text):
+            if char in ['[', '{']:
+                start_idx = i
                 break
         
-        if placeholder_idx == -1:
-            return False
-
-        # 2. 提取 Label 和 Value
-        # Label 是占位符之前的所有文本
-        label_text = "".join([r.text for r in runs[:placeholder_idx]])
-        
-        # 归一化处理以进行模糊匹配
-        import re
-        label_clean = re.sub(r'\s+', '', label_text)
-        value_str = str(value)
-        value_clean = re.sub(r'\s+', '', value_str)
-        
-        fill_content = ""
-        
-        # 尝试从 value_str 中剥离 label
-        # 情况A: value_str 包含 label (例如 "姓名: 张三")
-        # 我们需要在 value_str 中找到 label_clean 的结束位置
-        
-        # 简单的字符串包含检查
-        if label_clean and label_clean in value_clean:
-            # 找到 label 在 value 中的位置
-            # 这比较难精确对应到 value_str 的索引，因为空格差异。
-            # 采用字符逐个匹配法
-            val_ptr = 0
-            lbl_ptr = 0
-            match_end_idx = 0
-            
-            while val_ptr < len(value_str) and lbl_ptr < len(label_clean):
-                if value_str[val_ptr].isspace():
-                    val_ptr += 1
-                    continue
-                
-                if value_str[val_ptr] == label_clean[lbl_ptr]:
-                    val_ptr += 1
-                    lbl_ptr += 1
-                    match_end_idx = val_ptr
-                else:
+        if start_idx != -1:
+            # 找到最后一个 ] 或 }
+            for i in range(len(text) - 1, start_idx, -1):
+                if text[i] in [']', '}']:
+                    end_idx = i + 1
                     break
             
-            if lbl_ptr == len(label_clean):
-                fill_content = value_str[match_end_idx:].strip()
-            else:
-                # 匹配失败，可能 LLM 修改了 Label
-                # 这种情况下，为了安全，我们假设整个 value_str 都是内容？
-                # 或者回退到 False?
-                # 如果回退，会覆盖 Label。如果填入，会重复 Label。
-                # 优先保护 Label 不被覆盖。
-                return False
-        else:
-            # 情况B: value_str 不包含 label (例如 LLM 只返回了 "张三")
-            # 直接把 value_str 当作填充内容
-            fill_content = value_str.strip()
-
-        # 3. 执行填充
-        # 更新占位符 Run
-        target_run = runs[placeholder_idx]
-        # 在内容前后加空格以保持美观（可选，视模板而定，这里加一个前导空格防止紧贴）
-        # 只有当 fill_content 不为空时才填充，否则保持原样（或者清空？）
-        # 用户通常希望填入内容。
-        target_run.text = " " + fill_content + " " 
-        target_run.underline = True # 强制下划线
+            if end_idx != -1:
+                candidate = text[start_idx:end_idx]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
         
-        # 清除后续的占位符 Run (防止原占位符很长，被分成了多段)
-        for i in range(placeholder_idx + 1, len(runs)):
-            r = runs[i]
-            is_underlined = r.underline is not None and r.underline is not False
-            is_placeholder_chars = all(c in ' _\t\u3000\u00A0' for c in r.text)
-            if is_underlined and is_placeholder_chars:
-                r.text = ""
-            else:
-                # 遇到非占位符（如后面的括号说明），停止清除
-                break
-                
-        return True
+        # 4. 如果还是失败，尝试修复常见错误（如中文引号）
+        text_fixed = text.replace("“", '"').replace("”", '"')
+        try:
+            return json.loads(text_fixed)
+        except:
+            pass
+            
+        # 5. 记录失败的片段以便调试
+        error_snippet = text[:200] + "..." if len(text) > 200 else text
+        raise ValueError(f"无法解析 JSON (len={len(text)}). Snippet: {error_snippet}")
 
     def fill_document(self):
-        if not self.doc or self.knowledge_dict is None:
-            logger.error("文档或知识库未正确初始化")
+        if not self.table_structures or self.knowledge_dict is None:
+            logger.error("文档结构或知识库未正确初始化")
             return False
         
         filled_count = 0
-        used_identities = [] # 全局追踪已使用的实体标识
+        used_identities = []
+        self.pending_instructions = [] # Clear previous instructions
         
-        # --- 1. 处理正文段落 ---
-        # 用户需求变更：只需要回填表格的内容，不需要回填正文段落（包括下划线、占位符、Label等）
-        # logger.info("正在处理正文段落...")
-        # para_markdown, para_anchor_map, para_id_to_text_map = self._preprocess_paragraphs(self.doc.paragraphs)
+        # Sort tables by PageIndex to ensure groupby works correctly
+        sorted_tables = sorted(self.table_structures, key=lambda x: x.get("PageIndex", 0))
         
-        # if para_anchor_map:
-        #     logger.info(f"发现 {len(para_anchor_map)} 个段落填空位，正在请求 LLM 分析...")
-        #     fill_map = self.analyze_tables_with_llm(para_markdown, self.knowledge_dict, para_id_to_text_map, used_contexts=used_identities)
+        for page_idx, page_tables in groupby(sorted_tables, key=lambda x: x.get("PageIndex", 0)):
+            page_tables_list = list(page_tables)
+            logger.info(f"正在处理第 {page_idx} 页，共 {len(page_tables_list)} 个表格")
             
-        #     # 提取并记录本次使用的实体标识
-        #     identity = fill_map.pop("__identity__", None)
-        #     if identity:
-        #         used_identities.append(identity)
-        #         logger.info(f"正文段落使用了实体: {identity}")
+            page_tables_payload = []
+            for tbl in page_tables_list:
+                rows_python = self._convert_aspose_row_to_python_style(tbl.get("Rows", []))
+                page_tables_payload.append({
+                    "TableIndex": tbl.get("TableIndex"),
+                    "Rows": rows_python
+                })
             
-        #     for anchor_id, value in fill_map.items():
-        #         if anchor_id in para_anchor_map:
-        #             try:
-        #                 idx = para_anchor_map[anchor_id]
-        #                 para = self.doc.paragraphs[idx]
-                        
-        #                 # 智能填充逻辑
-        #                 original_text = para.text.strip()
-        #                 clean_val = str(value).strip()
-
-        #                 # 优先尝试智能下划线填充
-        #                 if self._smart_fill_paragraph(para, clean_val):
-        #                     filled_count += 1
-        #                     logger.debug(f"段落锚点 {anchor_id} 采用下划线保留模式填充")
-        #                     continue
-                        
-        #                 # 检查是否是 "Label: " 形式的纯标签段落（无下划线占位符）
-        #                 # 如果是，且 LLM 返回的值没有包含 Label，则采用追加模式，防止覆盖标签
-        #                 is_pure_label = re.search(r'[:：]\s*$', original_text)
-                        
-        #                 if is_pure_label and not clean_val.startswith(original_text[:min(5, len(original_text))]):
-        #                      # 追加模式：保留原标签，追加内容
-        #                      para.add_run(f" {clean_val}")
-        #                      logger.debug(f"段落锚点 {anchor_id} 采用追加模式填充")
-        #                 else:
-        #                     # 覆盖模式：全段替换
-        #                     # 注意：这会丢失段落内的部分格式（如加粗），但保留段落整体样式
-        #                     style = para.style
-        #                     para.text = clean_val
-        #                     para.style = style
-                        
-        #                 filled_count += 1
-        #                 logger.debug(f"段落锚点 {anchor_id} 已填充值: {value}")
-        #             except Exception as e:
-        #                 logger.error(f"段落填充异常: {anchor_id} - {str(e)}")
-        #         else:
-        #             logger.warning(f"LLM返回了不存在的段落锚点ID: {anchor_id}")
-        # else:
-        #     logger.info("正文段落中未发现填空位")
-
-        # --- 2. 处理表格 ---
-        for table_idx, table in enumerate(self.doc.tables):
-            logger.info(f"正在处理第{table_idx + 1}个表格")
-            
-            # 第一阶段：Word 模板的“数字化”预处理
-            table_markdown, anchor_map, id_to_text_map = self._preprocess_table(table)
-            
-            if not anchor_map:
-                logger.info("该表格未发现填空位，跳过")
+            if not page_tables_payload:
                 continue
-
-            # 第二阶段：LLM 分析并直接返回填充映射
-            # 将知识库数据作为上下文传给 LLM，并传入已使用的实体列表
-            fill_map = self.analyze_tables_with_llm(table_markdown, self.knowledge_dict, id_to_text_map, used_contexts=used_identities)
+                
+            # LLM Analysis (Page Chunk)
+            modified_page_tables = self.analyze_tables_with_llm(page_tables_payload, self.knowledge_dict, used_contexts=used_identities)
             
-            # 提取并记录本次使用的实体标识
-            identity = fill_map.pop("__identity__", None)
-            if identity:
+            if not isinstance(modified_page_tables, list):
+                logger.warning(f"第 {page_idx} 页 LLM 返回格式错误")
+                continue
+                
+            # Identity extraction
+            if modified_page_tables and isinstance(modified_page_tables[0], dict) and "__identity__" in modified_page_tables[0]:
+                identity = modified_page_tables[0]["__identity__"]
                 used_identities.append(identity)
-                logger.info(f"表格 {table_idx + 1} 使用了实体: {identity}")
+                logger.info(f"页面 {page_idx} 使用了实体: {identity}")
+                modified_page_tables = modified_page_tables[1:]
             
-            for anchor_id, value in fill_map.items():
-                if anchor_id in anchor_map:
-                    try:
-                        row, col = anchor_map[anchor_id]
-                        cell = table.cell(row, col)
-                        
-                        # 检查是否需要追加模式 (Append Mode)
-                        # 如果原单元格包含类似 "1. xxx (不超过xx字)" 的指令性文本，且 LLM 返回的内容不包含该头信息，则追加
-                        original_text = cell.text.strip()
-                        should_append = False
-                        
-                        # 识别指令性表头特征：
-                        # 1. 以数字开头 (1. / 1、 / 1 )
-                        # 2. 包含字数限制说明 (不超过...字)
-                        # 3. 新增：基于长度和数字开头的宽松匹配，与 _is_potential_slot 保持一致
-                        if len(original_text) > 0 and (
-                            re.match(r'^\d+(\.\d+)*[、. ]', original_text) or 
-                            re.search(r'[（(].*?不超过.*?字.*?[)）]', original_text) or
-                            (re.match(r'^\d+[.、\s]', original_text) and len(original_text) > 5)
-                        ):
-                            # 进一步检查：如果 LLM 返回的值已经包含了原文本（或者原文本的前一部分），则不需要追加，直接覆盖即可
-                            # 简单的模糊检查
-                            clean_val = str(value).strip()
-                            if clean_val.startswith(original_text[:min(10, len(original_text))]):
-                                should_append = False
-                            else:
-                                should_append = True
-                        
-                        if should_append:
-                            logger.info(f"检测到指令性表头，采用追加模式: {anchor_id}")
-                            
-                            # 1. 尝试从现有标题（第一段）提取样式
-                            font_style = {}
-                            if cell.paragraphs and cell.paragraphs[0].runs:
-                                font_style = self._extract_run_style(cell.paragraphs[0].runs[0])
-                                logger.info(f"锚点 {anchor_id}: 追加模式下，成功从标题提取字体样式: {font_style}")
-                            
-                            # 2. 追加新段落
-                            # 注意：add_paragraph 会在单元格末尾添加新段落
-                            new_para = cell.add_paragraph(str(value))
-                            
-                            # 3. 应用样式
-                            if font_style:
-                                for run in new_para.runs:
-                                    self._apply_run_style(run, font_style)
-                        else:
-                            # 尝试保留原有样式
-                            filled_via_smart = False
-                            if cell.paragraphs:
-                                # 优先尝试智能下划线填充
-                                if self._smart_fill_paragraph(cell.paragraphs[0], value):
-                                    filled_via_smart = True
-                            
-                            if not filled_via_smart:
-                                # 准备填充的值
-                                clean_val = str(value).strip()
-                                
-                                # === Label 保护逻辑 ===
-                                # 检查原文本是否包含 Label（以冒号结尾的前缀）
-                                # 常见 Label 格式： "Label：" 或 "Label:"
-                                # 且 Label 长度不应过长（例如不超过 10 个字符）
-                                label_match = re.match(r'^([^:：]{1,10}[:：])', original_text)
-                                if label_match:
-                                    label_prefix = label_match.group(1)
-                                    # 如果新值没有以这个 Label 开头，则补上
-                                    # 避免重复：如果 LLM 返回了 "Label: value"，就不需要补
-                                    if not clean_val.startswith(label_prefix):
-                                         # 特殊情况：如果原文本是 "起始：   年   月"，而新文本是 "2021年9月"
-                                         # 我们希望变成 "起始：2021年9月"
-                                         clean_val = label_prefix + clean_val
-                                         logger.info(f"锚点 {anchor_id}: 触发Label保护，已自动补全前缀 '{label_prefix}'")
+            # Process results for each table in the page
+            for mod_table in modified_page_tables:
+                 if not isinstance(mod_table, dict) or "TableIndex" not in mod_table:
+                     continue
+                 
+                 t_idx = mod_table["TableIndex"]
+                 mod_rows = mod_table.get("Rows", [])
+                 
+                 # Find original table data to compare
+                 original_table_data = next((t for t in page_tables_list if t["TableIndex"] == t_idx), None)
+                 if not original_table_data:
+                     continue
+                     
+                 original_rows = self._convert_aspose_row_to_python_style(original_table_data.get("Rows", []))
+                 
+                 filled_count = self._process_table_instructions(t_idx, original_rows, mod_rows, filled_count)
 
-                                if cell.paragraphs:
-                                    # 获取第一段
-                                    first_para = cell.paragraphs[0]
-                                    
-                                    # 调试信息：检查Runs状态
-                                    if not first_para.runs:
-                                        logger.info(f"锚点 {anchor_id}: 单元格段落无 Runs (可能是空单元格)，无法提取预设样式。建议在模板中输入一个空格并设置样式。")
-                                    
-                                    # 尝试提取字体样式（从第一个Run）
-                                    font_style = {}
-                                    if first_para.runs:
-                                        font_style = self._extract_run_style(first_para.runs[0])
-                                    else:
-                                        # 如果当前单元格为空（无Run），尝试从段落属性(pPr)中提取预设的字符样式
-                                        # 这通常是用户在空单元格中设置的格式
-                                        font_style = self._extract_paragraph_char_style(first_para)
-                                        if font_style:
-                                            logger.info(f"锚点 {anchor_id}: 成功从空单元格提取预设样式: {font_style}")
-                                        else:
-                                            logger.info(f"锚点 {anchor_id}: 当前单元格为空且无预设样式，将使用默认样式填充")
-
-                                    # 清空段落内容但保留段落属性
-                                    # 注意：first_para.clear() 会清除所有runs，但保留段落样式
-                                    first_para.clear()
-                                    
-                                    # --- Fix: 清除后续段落，防止多段落单元格出现内容残留 ---
-                                    # 如果是全量替换模式，且新内容包含了换行，或者我们认为这是在替换整个单元格
-                                    # 那么应该移除 cell.paragraphs[1:]
-                                    # 注意：在遍历列表时删除元素是危险的，应倒序删除
-                                    if len(cell.paragraphs) > 1:
-                                        for i in range(len(cell.paragraphs) - 1, 0, -1):
-                                            p_to_remove = cell.paragraphs[i]
-                                            # python-docx 没有直接的 delete_paragraph 方法
-                                            # 需要操作 XML 元素
-                                            try:
-                                                p_element = p_to_remove._element
-                                                p_element.getparent().remove(p_element)
-                                            except Exception as e:
-                                                logger.warning(f"清除残留段落失败: {e}")
-
-                                    # 添加新内容
-                                    # 如果 clean_val 包含换行符，add_run 不会自动换行，通常需要处理
-                                    # 但这里我们可以简单地让 add_run 处理文本，或者手动分割段落
-                                    # 如果 LLM 返回的内容确实包含换行，通常意味着它想表达多行结构
-                                    # 简单处理：将 \n 替换为 python-docx 的换行符，或者分割 add_run
-                                    # 不过 python-docx 的 run.text = "A\nB" 会被正确渲染为软回车还是？
-                                    # 通常 docx 中段落间换行是真回车，run 内 \n 是软回车 (Wait, docx text usually doesn't handle \n as paragraph break well in runs)
-                                    # 但为了保持一致性，如果之前是多段落，现在 LLM 返回单字符串带 \n，
-                                    # 最好还是作为单段落内的软回车，或者重建段落结构。
-                                    # 鉴于我们保留了 first_para，我们就在 first_para 里塞入内容。
-                                    
-                                    new_run = first_para.add_run(clean_val)
-                                    
-                                    # 应用字体样式
-                                    if font_style:
-                                        self._apply_run_style(new_run, font_style)
-                                else:
-                                    # 确保值为字符串
-                                    cell.text = clean_val
-                            
-                        filled_count += 1
-                        logger.debug(f"表格锚点 {anchor_id} 已填充值: {value}")
-                    except IndexError:
-                        logger.error(f"无效的单元格位置: {anchor_map.get(anchor_id)}")
-                    except Exception as e:
-                        logger.error(f"字段填写异常: {anchor_id} - {str(e)}")
-                else:
-                    logger.warning(f"LLM返回了不存在的表格锚点ID: {anchor_id}")
-                    
-        logger.info(f"完成文档填充，共填写{filled_count}个字段")
+        logger.info(f"完成文档分析，生成 {len(self.pending_instructions)} 条填充指令")
         return True
 
+    def _process_table_instructions(self, table_idx, original_structure, modified_rows, filled_count):
+        """
+        Smart comparison of original structure and LLM modified rows to handle:
+        1. Content Updates (using strict Label Protection & Fallback)
+        2. Row Insertions (when modified_rows has more items)
+        """
+        orig_idx = 0
+        mod_idx = 0
+        
+        while mod_idx < len(modified_rows):
+            mod_row = modified_rows[mod_idx]
+            
+            # Case 1: All original rows consumed. Treat remaining modified rows as Insertions (Append).
+            if orig_idx >= len(original_structure):
+                self._generate_insert_instructions(table_idx, mod_idx, mod_row)
+                filled_count += 1
+                mod_idx += 1
+                continue
+
+            orig_row = original_structure[orig_idx]
+            
+            # Helper to check if rows are "compatible" (structurally or anchor-wise)
+            def is_row_match(r_orig, r_mod):
+                if not isinstance(r_mod, list): return False
+                # If length mismatch is large, likely different row type
+                if abs(len(r_orig) - len(r_mod)) > 2: return False 
+                
+                match_score = 0
+                total_anchors = 0
+                
+                for c_o, c_m in zip(r_orig, r_mod):
+                    txt_o = c_o.get("text", "").strip()
+                    txt_m = c_m.get("text", "").strip() if isinstance(c_m, dict) else ""
+                    
+                    # If original has text (Anchor), modified should have it too
+                    if txt_o and len(txt_o) > 2 and not c_o.get("is_empty"):
+                        # Heuristic: Is this a label?
+                        if re.match(r'^[^：:]+[：:]$', txt_o) or txt_o in txt_m:
+                            match_score += 1
+                        total_anchors += 1
+                
+                if total_anchors > 0:
+                    return match_score >= (total_anchors * 0.5) # At least 50% anchors match
+                return True # If no anchors (empty row), assume match
+
+            # Case 2: Match Found
+            if is_row_match(orig_row, mod_row):
+                filled_count = self._generate_update_instructions(table_idx, mod_idx, orig_row, mod_row, filled_count)
+                orig_idx += 1
+                mod_idx += 1
+                continue
+            
+            # Case 3: Mismatch. Is it an Insertion?
+            # Lookahead: Does `orig_row` appear later in modified_rows?
+            found_orig_at = -1
+            for k in range(1, 10):
+                if mod_idx + k < len(modified_rows):
+                    if is_row_match(orig_row, modified_rows[mod_idx + k]):
+                        found_orig_at = mod_idx + k
+                        break
+            
+            if found_orig_at != -1:
+                # Found original row later. So [mod_idx ... found_orig_at - 1] are Insertions.
+                self._generate_insert_instructions(table_idx, mod_idx, mod_row)
+                filled_count += 1
+                mod_idx += 1
+                # Do NOT increment orig_idx
+            else:
+                # Original row NOT found later. Assume Update (or heavy modification).
+                filled_count = self._generate_update_instructions(table_idx, mod_idx, orig_row, mod_row, filled_count)
+                orig_idx += 1
+                mod_idx += 1
+        
+        return filled_count
+
+    def _generate_insert_instructions(self, table_idx, target_row_idx, mod_row_data):
+        if not isinstance(mod_row_data, list): return
+        # 1. Emit "insert_row"
+        self.pending_instructions.append({
+            "TableIndex": table_idx,
+            "RowIndex": target_row_idx,
+            "Action": "insert_row",
+            "CellIndex": 0,
+            "Text": ""
+        })
+        # 2. Emit updates for this new row's cells
+        for c_idx, mod_cell in enumerate(mod_row_data):
+            if isinstance(mod_cell, dict):
+                text = mod_cell.get("text", "")
+                if text:
+                    self.pending_instructions.append({
+                        "TableIndex": table_idx,
+                        "RowIndex": target_row_idx,
+                        "CellIndex": c_idx,
+                        "Text": text
+                    })
+
+    def _generate_update_instructions(self, table_idx, r_idx, row_data, mod_row, filled_count):
+        # Note: r_idx is the target row index in the dynamic table
+        if not isinstance(mod_row, list): return filled_count
+        
+        for c_idx, cell_info in enumerate(row_data):
+            if c_idx >= len(mod_row): break
+            mod_cell = mod_row[c_idx]
+            
+            if cell_info.get("is_merged"): continue
+                
+            original_text = cell_info.get("text", "").strip()
+            new_text = mod_cell.get("text", original_text) if isinstance(mod_cell, dict) else original_text
+            
+            # 过滤 LLM 可能返回的 "(Merged)" 占位符
+            if str(new_text).strip() == "(Merged)":
+                new_text = original_text
+                
+            operation_desc = "LLM Generate"
+            
+            # --- Fallback Strategy for Long Text Fields ---
+            # 如果 LLM 未修改内容，且是已知的长文本字段，尝试从知识库直接匹配
+            if new_text == original_text and isinstance(self.knowledge_dict, dict):
+                # 改为允许任何字典结构（不再强制扁平化），只要能找到对应 Key 即可
+                matched_kb_value = None
+                
+                # 1. 定义 Header 关键词与 Knowledge Key 的映射关系 (Fuzzy Match)
+                # Key: Header 关键词, Value: Knowledge Key (优先尝试)
+                header_mapping = [
+                    (["成果简介", "解决的教学问题"], ["成果简介", "主要解决的教学问题", "成果简介及主要解决的教学问题"]),
+                    (["方法", "解决教学问题的方法"], ["成果解决教学问题的方法", "解决教学问题的方法", "方法"]),
+                    (["创新点", "成果的创新点"], ["成果的创新点", "创新点"]),
+                    (["推广应用", "应用效果"], ["成果的推广应用效果", "推广应用效果", "推广应用"]),
+                ]
+                
+                found_key = None
+                # 尝试匹配 Header
+                for header_keywords, kb_candidate_keys in header_mapping:
+                    if any(hk in original_text for hk in header_keywords):
+                        # 尝试在 Knowledge Base 中寻找对应的 Key
+                        for candidate in kb_candidate_keys:
+                            if candidate in self.knowledge_dict:
+                                found_key = candidate
+                                break
+                    if found_key:
+                        break
+                
+                if found_key:
+                    raw_value = self.knowledge_dict[found_key]
+                    
+                    # 2. 格式化提取的值 (Handle List/Dict/String)
+                    extracted_text = ""
+                    
+                    if isinstance(raw_value, str):
+                        extracted_text = raw_value
+                    elif isinstance(raw_value, list):
+                        # 列表可能是 ["str1", "str2"] 或 [{"序号":1, "内容":...}, ...]
+                        lines = []
+                        for item in raw_value:
+                            if isinstance(item, str):
+                                lines.append(item)
+                            elif isinstance(item, dict):
+                                # 尝试提取 value 中包含“描述”、“内容”等的字段
+                                desc = ""
+                                # 优先找长文本字段
+                                for k, v in item.items():
+                                    if any(x in k for x in ["描述", "内容", "创新点", "方法", "问题"]) and isinstance(v, str):
+                                        desc = v
+                                        break
+                                # 没找到就找第一个 value 是 string 的
+                                if not desc:
+                                    for v in item.values():
+                                        if isinstance(v, str) and len(v) > 5:
+                                            desc = v
+                                            break
+                                
+                                # 尝试提取序号
+                                seq = str(item.get("序号", ""))
+                                if seq and desc:
+                                    lines.append(f"{seq}. {desc}")
+                                elif desc:
+                                    lines.append(desc)
+                        extracted_text = "\n".join(lines)
+                        
+                    elif isinstance(raw_value, dict):
+                        # 字典可能是 {"总体描述": "...", "具体内容": [...]}
+                        parts = []
+                        if "总体描述" in raw_value:
+                            parts.append(raw_value["总体描述"])
+                        if "具体内容" in raw_value and isinstance(raw_value["具体内容"], list):
+                            for item in raw_value["具体内容"]:
+                                if isinstance(item, dict):
+                                    seq = str(item.get("序号", ""))
+                                    content = item.get("内容", "") or item.get("详细描述", "")
+                                    if seq and content:
+                                        parts.append(f"{seq}. {content}")
+                                    elif content:
+                                        parts.append(content)
+                        extracted_text = "\n".join(parts)
+
+                    if extracted_text:
+                        matched_kb_value = extracted_text
+
+                if matched_kb_value:
+                    logger.info(f"触发规则兜底: 自动填充 '{original_text[:10]}...' using Key='{found_key}'")
+                    new_text = original_text.strip() + "\n" + matched_kb_value.strip()
+                    operation_desc = "Fallback Rule"
+
+            if new_text != original_text and new_text:
+                is_pure_label = re.match(r'^[^:：]{2,8}[:：]$', original_text)
+                if is_pure_label and len(str(new_text)) > len(original_text):
+                    if c_idx + 1 < len(row_data):
+                        right_cell_info = row_data[c_idx + 1]
+                        if right_cell_info.get("is_empty"):
+                            redirect_value = str(new_text).replace(original_text, "").strip()
+                            if redirect_value:
+                                logger.info(f"[Fill Op] Table {table_idx+1} ({r_idx},{c_idx+1}) | Header: '{original_text[:15]}...' | Op: Redirect to Right | Content: '{redirect_value[:20]}...'")
+                                self.pending_instructions.append({
+                                    "TableIndex": table_idx,
+                                    "RowIndex": r_idx,
+                                    "CellIndex": c_idx + 1,
+                                    "Text": redirect_value
+                                })
+                                filled_count += 1
+                                continue 
+                orig_norm = re.sub(r'\s+', '', original_text)
+                new_norm = re.sub(r'\s+', '', str(new_text))
+                is_label_like = bool(re.match(r'^[\u4e00-\u9fa5\s]{1,8}(?:[:：])?$', original_text)) or ("姓名" in original_text and len(original_text) <= 10)
+                if (str(new_text).startswith(original_text) or new_norm.startswith(orig_norm)) and is_label_like:
+                    if c_idx + 1 < len(row_data):
+                        right_cell_info = row_data[c_idx + 1]
+                        appended = str(new_text)[len(original_text):].strip()
+                        if not appended and new_norm.startswith(orig_norm):
+                            appended = new_norm[len(orig_norm):].strip()
+                        if right_cell_info.get("is_empty") and appended:
+                            logger.info(f"[Fill Op] Table {table_idx+1} ({r_idx},{c_idx+1}) | Header: '{original_text[:15]}...' | Op: Append to Right | Content: '{appended[:20]}...'")
+                            self.pending_instructions.append({
+                                "TableIndex": table_idx,
+                                "RowIndex": r_idx,
+                                "CellIndex": c_idx + 1,
+                                "Text": appended
+                            })
+                            filled_count += 1
+                            continue 
+
+                # --- Smart Logic (Simplified) ---
+                original_new_text = str(new_text)
+                
+                # 1. Clean Label Prefix
+                # 智能判断是否为复杂标题（如 "1. 成果简介"、"3.创新点(800字)"）
+                # 如果是复杂标题，则不执行前缀清除，保留 LLM 返回的完整 "标题+内容"
+                is_numbered_header = bool(re.match(r'^[\(\（]?\d+[.\、\）\)]', original_text))
+                is_instruction_header = any(k in original_text for k in ["不超过", "字)", "字）", "简介", "创新点", "应用效果", "存在问题"])
+                is_long_header = len(original_text) > 15
+                
+                should_skip_clean = is_numbered_header or is_instruction_header or is_long_header
+                
+                if str(new_text).startswith(original_text) and len(str(new_text)) > len(original_text):
+                    if not should_skip_clean:
+                        new_text = str(new_text)[len(original_text):].strip()
+                elif not should_skip_clean:
+                    label_match = re.match(r'^([^:：]{1,5}[:：])', original_text)
+                    if label_match:
+                        prefix = label_match.group(1)
+                        if str(new_text).startswith(prefix) and len(str(new_text)) > len(prefix):
+                            new_text = str(new_text)[len(prefix):].strip()
+
+                # 2. Label Protection
+                label_match = re.match(r'^([^:：]{1,10}[:：])', original_text)
+                if label_match:
+                    label_prefix = label_match.group(1)
+                    # Fuzzy check: ignore spaces and punctuation to prevent duplicates
+                    # 模糊匹配：忽略空格和标点，防止出现 "起始年月：起始年月 2023" 这种重复
+                    clean_punc_pattern = r'[\s:：_]+'
+                    clean_label = re.sub(clean_punc_pattern, '', label_prefix)
+                    clean_new = re.sub(clean_punc_pattern, '', str(new_text))
+                    
+                    if not clean_new.startswith(clean_label):
+                        new_text = label_prefix + str(new_text)
+                
+                # 2.5 Fill Blank Cleaning
+                # 修复：对于“年 月”类型的填空，LLM 可能会在填完后重复附带未填的模板，需要清除
+                # Improved cleaning logic to handle multi-line garbage and different formats
+                is_fill_blank_check = re.search(r'[:：]\s*[_\u005F\u2013-\u2017\s]{2,}', original_text) or ("年" in original_text and "月" in original_text)
+                
+                if is_fill_blank_check:
+                        lines = str(new_text).splitlines()
+                        cleaned_lines = []
+                        
+                        # Regex 1: "Label: ... Year ... Month" (standard date template)
+                        # Matches start of line (ignoring leading spaces), optional label, optional colon, Year, Month
+                        p1 = re.compile(r'^\s*(?:[\u4e00-\u9fa5\w\(\)（）\s]{2,50})?[:：]?\s*年\s*月\s*$')
+                        
+                        # Regex 2: "Label: ... Year" (year only template)
+                        # Must have underscores or multiple spaces before Year to distinguish from filled "2014 Year"
+                        p2 = re.compile(r'^\s*(?:[\u4e00-\u9fa5\w\(\)（）\s]{2,50})?[:：]?\s*[_\u005F\u2013-\u2017\s]{2,}\s*年\s*$')
+
+                        for line in lines:
+                            # Skip lines that look like unfilled templates
+                            if p1.match(line):
+                                logger.info(f"[Cleaner] Removed garbage line (Type 1): '{line.strip()}'")
+                                continue
+                            if p2.match(line):
+                                logger.info(f"[Cleaner] Removed garbage line (Type 2): '{line.strip()}'")
+                                continue
+                            cleaned_lines.append(line)
+                        
+                        cleaned_text = "\n".join(cleaned_lines).strip()
+                        
+                        if len(cleaned_text) < len(str(new_text).strip()):
+                            new_text = cleaned_text
+
+                # 3. Smart Append
+                is_cleaned = len(str(new_text)) < len(original_new_text) if 'original_new_text' in locals() else False
+                has_content = len(str(new_text).strip()) > 0
+                
+                if has_content and not is_cleaned:
+                    is_fill_blank = is_fill_blank_check
+                    is_long_header = len(original_text) > 20 and not is_fill_blank
+                    is_keyword_header = any(k in original_text for k in ["简介", "方法", "概述", "说明", "问题"])
+                    
+                    if (is_long_header or is_keyword_header):
+                        original_fingerprint_clean = re.sub(r'\s+', '', original_text[:15])
+                        new_text_clean = re.sub(r'\s+', '', str(new_text))
+                        
+                        # 增强判断：检查是否保留了原来的标签头部（Savior Logic）
+                        # 如果新文本以原文本的头部开头（忽略空白和下划线），则认为是填充而非覆盖，不需要追加原文本
+                        clean_pattern = r'[\s_]+'
+                        original_clean_full = re.sub(clean_pattern, '', original_text)
+                        new_clean_full = re.sub(clean_pattern, '', str(new_text))
+                        
+                        # 取前 8 个有效字符作为前缀指纹 (例如 "起始：", "1.成果简介")
+                        prefix_len = min(8, len(original_clean_full))
+                        original_prefix = original_clean_full[:prefix_len]
+                        starts_with_prefix = new_clean_full.startswith(original_prefix) if original_prefix else False
+                        
+                        # 添加调试日志
+                        logger.info(f"[SmartAppend] Cell({r_idx},{c_idx}) Long/Key={is_long_header}/{is_keyword_header}")
+                        logger.info(f"[SmartAppend] OrigPrefix: {original_prefix} | NewStart: {new_clean_full[:10] if new_clean_full else ''} | Match: {starts_with_prefix}")
+
+                        if original_fingerprint_clean and original_fingerprint_clean not in new_text_clean and not starts_with_prefix:
+                            logger.info(f"检测到长标题被覆盖，正在尝试恢复追加模式: {original_text[:10]}...")
+                            new_text = original_text.strip() + "\n" + str(new_text).strip()
+                            operation_desc = "Smart Append (Recovery)"
+
+                    # Add Instruction
+                    logger.info(f"[Fill Op] Table {table_idx+1} ({r_idx},{c_idx}) | Header: '{original_text[:15]}...' | Op: {operation_desc} | Content: '{str(new_text)[:20].replace(chr(10), ' ')}...'")
+                    self.pending_instructions.append({
+                        "TableIndex": table_idx,
+                        "RowIndex": r_idx,
+                        "CellIndex": c_idx,
+                        "Text": str(new_text)
+                    })
+                    filled_count += 1
+        return filled_count
+
     def save_document(self, filename=None):
-        if not self.doc:
-            logger.error("文档实例未初始化")
+        if not self.pending_instructions:
+            logger.warning("没有可执行的填充指令")
             return False
+            
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_name = os.path.splitext(os.path.basename(self.word_template_path))[0]
             filename = f"{base_name}_filled_{timestamp}.docx"
-        output_path = os.path.join(self.output_folder, filename)
+        
+        output_path = os.path.abspath(os.path.join(self.output_folder, filename))
+        instructions_path = os.path.abspath(os.path.join(self.output_folder, "fill_tasks.json"))
+        
         try:
-            self.doc.save(output_path)
+            # Save instructions
+            with open(instructions_path, "w", encoding='utf-8') as f:
+                json.dump(self.pending_instructions, f, ensure_ascii=False, indent=2)
+            
+            # Execute Aspose Fill
+            logger.info(f"调用 Aspose 执行填充: {instructions_path} -> {output_path}")
+            print(f"[Skill] Invoking Aspose Backend for Document Filling: {ASPOSE_EXE}") # Console output
+            cmd = [ASPOSE_EXE, self.word_template_path, "fill", instructions_path, output_path]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            if result.returncode != 0:
+                logger.error(f"Aspose Fill failed: {result.stderr}")
+                logger.error(f"Stdout: {result.stdout}")
+                return False
+                
             logger.info(f"文档已保存至: {output_path}")
             return True
         except Exception as e:
@@ -850,7 +672,7 @@ class AutoTable:
             return False
 
     def run(self):
-        logger.info("启动自动化填表流程")
+        logger.info("启动自动化填表流程 (Aspose版)")
         if all([
             self.load_knowledge_base(),
             self.load_template(),
